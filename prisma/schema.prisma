@@ -1,0 +1,698 @@
+// Redlook B2C — Prisma schema
+// Forked from the FreshKart schema; the database layout is unchanged so all the
+// inherited Order / Customer / Credit logic keeps working. Apparel-incompatible
+// columns (`unit`, `is_organic`, `freshness`) carry repurposed semantics — see
+// prisma/seed.js for the apparel-friendly meaning of each.
+// All decimal monetary fields use Prisma Decimal (Postgres NUMERIC) for
+// accurate currency math.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------------------------------------
+// 10.1 Customers
+// ------------------------------------------------------------
+model Customer {
+  customer_id         String    @id @default(uuid())
+  full_name           String    @db.VarChar(100)
+  email               String    @unique @db.VarChar(150)
+  phone               String    @unique @db.VarChar(15)
+  password_hash       String    @db.VarChar(255)
+  date_of_birth       DateTime? @db.Date
+  gender              String?   @db.VarChar(10)
+  profile_picture_url String?   @db.VarChar(500)
+  loyalty_points      Int       @default(0)
+  account_status      String    @default("Active") @db.VarChar(20)
+  email_verified      Boolean   @default(false)
+  phone_verified      Boolean   @default(false)
+  // Customer type — drives credit eligibility defaults and the storefront
+  // experience. B2C is the retail default; B2B unlocks higher credit
+  // limits and exposes business_name / GSTIN for invoicing. Type itself
+  // is admin-controlled (no self-conversion to B2B from the customer UI).
+  customer_type       String    @default("B2C") @db.VarChar(10)
+  business_name       String?   @db.VarChar(150)
+  gstin               String?   @db.VarChar(15)
+  // Preferred storefront language. ISO 639-1: 'en' (English, default), 'hi'
+  // (Hindi), 'bn' (Bengali). Synced from the in-app language switcher when
+  // logged in so the choice follows the customer across devices. Backend
+  // also reads this to localize email/SMS notifications (Phase 3).
+  language            String    @default("en") @db.VarChar(5)
+  // Phone-OTP verification storage (mirrors the prior email-OTP design but
+  // SMS-delivered). bcrypt hash — never store plaintext. Cleared on
+  // successful verify, on a fresh resend, and on profile phone change.
+  phone_otp_hash         String?   @db.VarChar(255)
+  phone_otp_expires_at   DateTime?
+  // Counts wrong attempts since the last fresh OTP issue. Caps abuse from
+  // brute-forcing 6-digit codes by locking the OTP after 5 misses — user
+  // then has to request a resend, which mints a new code.
+  phone_otp_attempts     Int       @default(0)
+  // Wall-clock of the most recent OTP issue. Used to throttle resends so a
+  // bot can't trigger an unbounded number of SMS per registration (which
+  // would also burn MSG91 credits).
+  phone_otp_issued_at    DateTime?
+  // Forgot-password OTP storage — separate columns so a phone-verification
+  // OTP and a password-reset OTP can co-exist for the same customer without
+  // overwriting each other. channel = 'email' | 'sms' to record the path
+  // the code was sent through. Cleared on successful reset / new request.
+  password_reset_otp_hash       String?   @db.VarChar(255)
+  password_reset_otp_expires_at DateTime?
+  password_reset_otp_attempts   Int       @default(0)
+  password_reset_otp_issued_at  DateTime?
+  password_reset_otp_channel    String?   @db.VarChar(10)
+  notification_prefs  Json?
+  created_at          DateTime  @default(now())
+  last_login          DateTime?
+  updated_at          DateTime  @updatedAt
+
+  addresses          Address[]
+  orders             Order[]
+  cart               Cart?
+  wishlist           WishlistItem[]
+  reviews            Review[]
+  sessions           Session[]
+  coupon_redemptions CouponRedemption[]
+  credit_config      CustomerCreditConfig?
+  credit_transactions CreditTransaction[]
+  payments_received  PaymentReceived[]
+}
+
+// Holds a sign-up in flight while we wait for the customer to enter the OTP
+// SMS'd to them. The Customer row is NOT created until verify-otp succeeds —
+// so an abandoned signup never pollutes the customer table or holds the
+// email/phone unique slot indefinitely (we can prune stale rows by created_at).
+//
+// Email + phone are unique here too: a second registration attempt with the
+// same email/phone replaces the prior pending row (most natural UX for "I
+// fat-fingered the number, let me try again"). If the email/phone collides
+// with an actual Customer the register endpoint rejects upstream.
+//
+// The OTP storage mirrors Customer.phone_otp_* exactly so the same hashing /
+// throttle / attempts logic applies; on verify-otp success we move the pending
+// row's data into Customer in a single transaction and delete the pending row.
+model PendingRegistration {
+  pending_id           String    @id @default(uuid())
+  full_name            String    @db.VarChar(100)
+  email                String    @unique @db.VarChar(150)
+  phone                String    @unique @db.VarChar(15)
+  password_hash        String    @db.VarChar(255)
+  date_of_birth        DateTime? @db.Date
+  gender               String?   @db.VarChar(10)
+  phone_otp_hash       String    @db.VarChar(255)
+  phone_otp_expires_at DateTime
+  phone_otp_attempts   Int       @default(0)
+  phone_otp_issued_at  DateTime
+  created_at           DateTime  @default(now())
+
+  @@index([created_at])
+}
+
+// Sessions back JWT issuance (so /auth/logout can invalidate). One row per active token.
+model Session {
+  token       String   @id
+  customer    Customer @relation(fields: [customer_id], references: [customer_id], onDelete: Cascade)
+  customer_id String
+  created_at  DateTime @default(now())
+  expires_at  DateTime
+}
+
+// ------------------------------------------------------------
+// 10.2 Addresses
+// ------------------------------------------------------------
+model Address {
+  address_id      String   @id @default(uuid())
+  customer        Customer @relation(fields: [customer_id], references: [customer_id], onDelete: Cascade)
+  customer_id     String
+  label           String   @db.VarChar(20)
+  recipient_name  String   @db.VarChar(100)
+  recipient_phone String   @db.VarChar(15)
+  address_line1   String   @db.VarChar(255)
+  address_line2   String?  @db.VarChar(255)
+  landmark        String?  @db.VarChar(100)
+  city            String   @db.VarChar(50)
+  state           String   @db.VarChar(50)
+  pincode         String   @db.VarChar(6)
+  latitude        Decimal? @db.Decimal(10, 7)
+  longitude       Decimal? @db.Decimal(10, 7)
+  // Provenance of the lat/lng above. 'device' = customer granted browser
+  // geolocation (precise GPS, usually within tens of meters). 'geocode' =
+  // server-side Nominatim lookup from the address text (precision varies
+  // wildly, often pincode-centroid only). Surfaced to delivery staff so
+  // they know whether the map pin is GPS-accurate or "somewhere in this
+  // neighbourhood". Null = pre-existing row from before the column was
+  // added; treat as 'geocode' for display purposes.
+  location_source      String?   @db.VarChar(10)
+  // Browser-reported accuracy radius in meters (HTML5 Geolocation
+  // `coords.accuracy`). Only populated when location_source='device'.
+  // Lets the admin/delivery view show "GPS ±12 m" so they trust the pin
+  // more than for "GPS ±400 m" (which means the customer is indoors and
+  // the OS fell back to wifi triangulation).
+  location_accuracy    Float?
+  // Wall-clock when the device GPS reading was captured. Useful when the
+  // saved address is older than the current order — admin can decide
+  // whether to ask the customer to refresh on checkout.
+  location_captured_at DateTime?
+  is_default      Boolean  @default(false)
+
+  @@index([customer_id])
+}
+
+// ------------------------------------------------------------
+// 10.6 Categories
+// ------------------------------------------------------------
+model Category {
+  category_id        String  @id // human-readable ids: leafy, root, etc.
+  name               String  @unique @db.VarChar(50)
+  icon               String  @db.VarChar(10)
+  parent_category_id String?
+  // Category-level markdown applied to every product in the group. Combined
+  // with Product.discount_percent and BusinessSettings.global_discount_*;
+  // the resolver picks the largest of the three so the customer always
+  // sees the best deal. 0 = no category discount.
+  discount_percent   Decimal @default(0) @db.Decimal(5, 2)
+  // Per-field translations. Shape: { name: { hi: "...", bn: "..." } }.
+  // Empty/missing locales fall back to the canonical column (English).
+  // Admin enters values via the per-language fields on the category form.
+  translations       Json?
+
+  products Product[]
+}
+
+// ------------------------------------------------------------
+// 10.3 Products
+// ------------------------------------------------------------
+model Product {
+  product_id     String   @id // p1..p12 by seed; uuid for newly admin-created
+  name           String   @db.VarChar(100)
+  category       Category @relation(fields: [category_id], references: [category_id])
+  category_id    String
+  description    String?
+  price_per_unit Decimal  @db.Decimal(10, 2)
+  unit           String   @db.VarChar(10) // kg / piece / bunch
+  stock_quantity Decimal  @default(0) @db.Decimal(10, 2)
+  is_organic     Boolean  @default(false)
+  image          String   @db.VarChar(500) // emoji or URL
+  rating         Decimal  @default(0) @db.Decimal(3, 2)
+  reviews_count  Int      @default(0)
+  freshness      String?  @db.VarChar(50)
+  status         String   @default("Active") @db.VarChar(20)
+  // Per-product return policy. Customers requesting a return are blocked
+  // from selecting items where this is false; if every item in an order is
+  // non-returnable the entire return CTA is hidden client-side. Default
+  // true preserves the prior (everything returnable) behaviour for
+  // pre-existing rows after migration.
+  is_returnable  Boolean  @default(true)
+  // Per-SKU markdown. Stacks alongside the category and platform-wide
+  // discounts in BusinessSettings — the pricing resolver picks the largest
+  // of the three. 0 = no product-specific discount.
+  discount_percent Decimal @default(0) @db.Decimal(5, 2)
+  // Per-field translations. Shape:
+  //   { name: { hi, bn }, description: { hi, bn }, freshness: { hi, bn } }
+  // Empty/missing locales fall back to the canonical English column.
+  // Admin enters Hindi/Bengali via per-language fields on the product form.
+  translations   Json?
+  created_at     DateTime @default(now())
+
+  order_items    OrderItem[]
+  cart_items     CartItem[]
+  wishlist_items WishlistItem[]
+  reviews        Review[]
+
+  @@index([category_id])
+  @@index([status])
+}
+
+// ------------------------------------------------------------
+// 10.4 Orders
+// ------------------------------------------------------------
+model Order {
+  order_id         String   @id
+  customer         Customer @relation(fields: [customer_id], references: [customer_id])
+  customer_id      String
+  // Snapshot of address at order-time so deleting saved address doesn't break history
+  address_snapshot Json
+  order_date       DateTime @default(now())
+  delivery_slot    String   @db.VarChar(50)
+  subtotal         Decimal  @db.Decimal(10, 2)
+  discount         Decimal  @default(0) @db.Decimal(10, 2)
+  delivery_charge  Decimal  @default(0) @db.Decimal(10, 2)
+  tax              Decimal  @default(0) @db.Decimal(10, 2)
+  total_amount     Decimal  @db.Decimal(10, 2)
+  payment_method   String   @db.VarChar(20)
+  payment_status   String   @default("Pending") @db.VarChar(20)
+  // Razorpay handle for the gateway-side Order (returned by orders.create()).
+  // Populated for UPI/CARD/NETBANKING placements; null for COD. We hand this
+  // to the Razorpay Checkout SDK and use it to look the order back up on the
+  // verify + webhook callbacks.
+  razorpay_order_id   String? @db.VarChar(40)
+  // Razorpay's payment id (pay_xxx) — populated by /api/payments/verify only
+  // after the HMAC signature on (rzp_order_id|rzp_payment_id) checks out.
+  // Until that succeeds, payment_status stays Pending.
+  razorpay_payment_id String? @db.VarChar(40)
+  order_status     String   @default("Placed") @db.VarChar(20)
+  timeline         Json     @default("[]") // array of {status, at, note}
+  // Open-box proof-of-delivery photos uploaded by the rider/admin at
+  // the Mark-Delivered step. Array of { url, uploaded_at, uploaded_by }
+  // where url is relative (served via the same /uploads static mount as
+  // product images). Optional — empty array means no photos captured.
+  // Admin-only visibility (not exposed on the customer order serializer).
+  delivery_photos  Json     @default("[]")
+
+  items               OrderItem[]
+  credit_transactions CreditTransaction[]
+
+  @@index([customer_id])
+  @@index([order_status])
+}
+
+// ------------------------------------------------------------
+// 10.5 Order Items (snapshots so future product edits don't change historical orders)
+// ------------------------------------------------------------
+model OrderItem {
+  order_item_id String  @id @default(uuid())
+  order         Order   @relation(fields: [order_id], references: [order_id], onDelete: Cascade)
+  order_id      String
+  product       Product @relation(fields: [product_id], references: [product_id])
+  product_id    String
+  name          String  @db.VarChar(100)
+  image         String  @db.VarChar(500)
+  unit          String  @db.VarChar(10)
+  quantity      Decimal @db.Decimal(10, 2)
+  // Pre-discount price at order time. unit_price is what the customer was
+  // charged (post-discount); mrp is the original sticker price. Together
+  // they let invoices and order-history pages show "you saved Rs. X" with
+  // numbers that never drift when admins later change a product's price
+  // or discount.
+  mrp           Decimal @default(0) @db.Decimal(10, 2)
+  unit_price    Decimal @db.Decimal(10, 2)
+  line_total    Decimal @db.Decimal(10, 2)
+
+  @@index([order_id])
+}
+
+// ------------------------------------------------------------
+// 10.6 Cart (one per customer)
+// ------------------------------------------------------------
+model Cart {
+  cart_id     String   @id @default(uuid())
+  customer    Customer @relation(fields: [customer_id], references: [customer_id], onDelete: Cascade)
+  customer_id String   @unique
+  updated_at  DateTime @updatedAt
+
+  items CartItem[]
+}
+
+model CartItem {
+  cart_item_id String  @id @default(uuid())
+  cart         Cart    @relation(fields: [cart_id], references: [cart_id], onDelete: Cascade)
+  cart_id      String
+  product      Product @relation(fields: [product_id], references: [product_id])
+  product_id   String
+  qty          Decimal @db.Decimal(10, 2)
+
+  @@unique([cart_id, product_id])
+}
+
+// ------------------------------------------------------------
+// 10.6 Wishlist
+// ------------------------------------------------------------
+model WishlistItem {
+  customer    Customer @relation(fields: [customer_id], references: [customer_id], onDelete: Cascade)
+  customer_id String
+  product     Product  @relation(fields: [product_id], references: [product_id], onDelete: Cascade)
+  product_id  String
+  added_at    DateTime @default(now())
+
+  @@id([customer_id, product_id])
+}
+
+// ------------------------------------------------------------
+// 10.6 Reviews (FR-PROD-06)
+// ------------------------------------------------------------
+model Review {
+  review_id   String   @id @default(uuid())
+  product     Product  @relation(fields: [product_id], references: [product_id], onDelete: Cascade)
+  product_id  String
+  customer    Customer @relation(fields: [customer_id], references: [customer_id])
+  customer_id String
+  rating      Int
+  comment     String?
+  created_at  DateTime @default(now())
+
+  @@unique([product_id, customer_id])
+}
+
+// ------------------------------------------------------------
+// 10.6 Coupons
+// ------------------------------------------------------------
+model Coupon {
+  coupon_id    String    @id @default(uuid())
+  code         String    @unique @db.VarChar(30)
+  type         String    @db.VarChar(20) // PERCENT | FLAT
+  value        Decimal   @db.Decimal(10, 2)
+  min_order    Decimal   @default(0) @db.Decimal(10, 2)
+  max_uses     Int?
+  used_count   Int       @default(0)
+  valid_from   DateTime  @default(now())
+  valid_until  DateTime?
+  is_active    Boolean   @default(true)
+
+  redemptions  CouponRedemption[]
+}
+
+// One row per (coupon, customer) redemption. The unique constraint enforces
+// "one use per customer per coupon" at the DB level — even if two requests
+// race the SELECT/INSERT, the second one fails fast on the unique index.
+// `order_id` is captured for traceability but isn't a hard FK because we
+// want the redemption to survive an Order being soft-cleaned later.
+model CouponRedemption {
+  id          String   @id @default(uuid())
+  coupon      Coupon   @relation(fields: [coupon_id], references: [coupon_id], onDelete: Cascade)
+  coupon_id   String
+  customer    Customer @relation(fields: [customer_id], references: [customer_id], onDelete: Cascade)
+  customer_id String
+  order_id    String?
+  redeemed_at DateTime @default(now())
+
+  @@unique([coupon_id, customer_id])
+  @@index([customer_id])
+}
+
+// ------------------------------------------------------------
+// 10.6 Notifications log (FR-NOT-01..03)
+// One row per dispatched email/SMS so admin can audit deliverability.
+// ------------------------------------------------------------
+model Notification {
+  notification_id String    @id @default(uuid())
+  customer_id     String?
+  channel         String    @db.VarChar(20)  // email | sms | push
+  to_address      String    @db.VarChar(255) // recipient email or phone
+  template        String    @db.VarChar(100) // e.g. order.placed
+  subject         String?   @db.VarChar(200)
+  body            String?
+  status          String    @default("queued") @db.VarChar(20) // queued | sent | failed
+  provider        String?   @db.VarChar(50)  // console | sendgrid | msg91 | …
+  error           String?
+  created_at      DateTime  @default(now())
+  sent_at         DateTime?
+
+  @@index([customer_id])
+  @@index([status])
+}
+
+// ------------------------------------------------------------
+// 8.4 Audit logs
+// ------------------------------------------------------------
+model AuditLog {
+  audit_id    String   @id @default(uuid())
+  customer_id String?
+  action      String   @db.VarChar(100)
+  meta        Json?
+  ip          String?  @db.VarChar(45)
+  created_at  DateTime @default(now())
+
+  @@index([customer_id])
+}
+
+// ------------------------------------------------------------
+// 10.6 Admin users (FR-ADM-07 role-based access control)
+// Kept separate from Customer so blast radius of admin-portal bugs
+// can never touch the consumer login flow.
+// ------------------------------------------------------------
+model AdminUser {
+  admin_id      String         @id @default(uuid())
+  full_name     String         @db.VarChar(100)
+  email         String         @unique @db.VarChar(150)
+  password_hash String         @db.VarChar(255)
+  // Per-tile permissions. Each entry is a tile key from the catalog in
+  // middleware/adminAuth.js (orders, products, categories, coupons,
+  // customers, reviews, reports, settings, admin-users). Granting a tile
+  // gives full access — the previous read-vs-write distinction was a role
+  // artifact and is gone. Dashboard and self-profile are always visible.
+  // Application enforces min-1 at the route layer (an admin with no
+  // permissions can authenticate but see nothing, so we reject).
+  permissions   String[]
+  // Optional category whitelist for the Products + Categories tiles.
+  // Empty array (default) = unrestricted, admin can manage every product
+  // and category. Populated = admin can only list/create/update/delete
+  // products in these categories AND can only edit these category rows
+  // themselves. Enforced via scopeWhere() / isCategoryInScope() in
+  // middleware/adminAuth.js; does NOT affect orders, coupons, customers,
+  // reviews, settings, or admin-users tiles (those remain global).
+  category_scope String[]      @default([])
+  // Optional B2B business-name scope. When set, every list/report/
+  // export endpoint that exposes customer or order data is auto-
+  // filtered to Customer rows whose business_name matches this value
+  // (one business can have many contact / login records under it, so
+  // we scope by business name rather than by a single customer_id —
+  // otherwise multi-contact B2B accounts would only see one of their
+  // own contacts' data). Null = unscoped (default for internal staff).
+  scoped_business_name String? @db.VarChar(150)
+  status        String         @default("Active") @db.VarChar(20)
+  created_at    DateTime       @default(now())
+  last_login    DateTime?
+
+  sessions AdminSession[]
+}
+
+// JWT-backed sessions for admin tokens. Separate table from customer Session
+// so admin/customer logout flows never collide.
+model AdminSession {
+  token      String    @id
+  admin      AdminUser @relation(fields: [admin_id], references: [admin_id], onDelete: Cascade)
+  admin_id   String
+  created_at DateTime  @default(now())
+  expires_at DateTime
+}
+
+// Singleton row of operational thresholds the admin can change at runtime
+// (BRD §11.7 admin operational controls). Always exactly one row keyed by
+// id=1 — seed/migration creates it; the admin endpoint only updates.
+model BusinessSettings {
+  id                         Int      @id @default(1)
+  min_order_value            Decimal  @default(499) @db.Decimal(10, 2)
+  min_order_quantity         Int      @default(1)
+  delivery_charge            Decimal  @default(79) @db.Decimal(10, 2)
+  free_delivery_over         Decimal  @default(999) @db.Decimal(10, 2)
+  delivery_slot_buffer_hours Int      @default(5)
+  // Admin-configurable delivery slot catalog. Storefront fetches this via
+  // /api/settings and renders the pick list at checkout; each "today" slot
+  // is auto-disabled once (slot.start_hour − delivery_slot_buffer_hours) is
+  // in the past.
+  // Shape: [{ id, day_offset, start_hour, end_hour, label, enabled }]
+  //   day_offset: 0=today, 1=tomorrow, 2=day-after, etc.
+  //   start_hour / end_hour: 0–23 (24-hour clock)
+  //   label: "4 PM – 7 PM" style — storefront prefixes with the day label.
+  //   enabled: false = hidden from customers; admin keeps the row for later.
+  // Default mirrors the original hardcoded array in pages.jsx so the
+  // storefront keeps working without any admin action.
+  delivery_slots             Json     @default("[{\"id\":\"slot-today-4pm\",\"day_offset\":0,\"start_hour\":16,\"end_hour\":19,\"label\":\"4 PM – 7 PM\",\"enabled\":true},{\"id\":\"slot-today-7pm\",\"day_offset\":0,\"start_hour\":19,\"end_hour\":22,\"label\":\"7 PM – 10 PM\",\"enabled\":true},{\"id\":\"slot-tomorrow-7am\",\"day_offset\":1,\"start_hour\":7,\"end_hour\":10,\"label\":\"7 AM – 10 AM\",\"enabled\":true},{\"id\":\"slot-tomorrow-10am\",\"day_offset\":1,\"start_hour\":10,\"end_hour\":13,\"label\":\"10 AM – 1 PM\",\"enabled\":true},{\"id\":\"slot-tomorrow-4pm\",\"day_offset\":1,\"start_hour\":16,\"end_hour\":19,\"label\":\"4 PM – 7 PM\",\"enabled\":true}]")
+  // Customer support contacts — surfaced on the storefront via the floating
+  // Help widget and the footer. Stored as plain strings (no formatting
+  // assumptions); the widget formats `tel:`/`mailto:`/`wa.me/` links.
+  support_phone              String?  @db.VarChar(20)
+  support_whatsapp           String?  @db.VarChar(20)
+  support_email              String?  @db.VarChar(150)
+  support_message            String?  @db.VarChar(500)
+  // Active site-wide theme. One of: emerald (default) | dark | sunrise |
+  // ocean | lavender. Read by both customer and admin shells on mount, applied
+  // via `data-theme` on <html>. The "dark" value also adds the `dark` class so
+  // Tailwind dark: variants engage. Per-user theme overrides are not exposed —
+  // this is an admin/branding control, not a personal preference.
+  theme                      String   @default("emerald") @db.VarChar(20)
+  // First order_status at which cancellation becomes blocked. Customer-side
+  // /api/orders/:id/cancel and admin-side PUT /:id/status (target=Cancelled)
+  // both consult this. Allowed values mirror Order.order_status:
+  //   'Confirmed' → only 'Placed' orders can be cancelled
+  //   'Packed'    → 'Placed' or 'Confirmed' can be cancelled
+  //   'Out for Delivery' (default, matches prior behaviour) → up to 'Packed'
+  //   'Delivered' → cancellation allowed all the way to OFD (most lenient)
+  // The customer-facing UI surfaces this as "Orders can't be cancelled once
+  // <X>" so the policy is visible upfront.
+  cancellation_cutoff_status String   @default("Out for Delivery") @db.VarChar(20)
+  // Return window: hours after the Delivered timestamp during which a
+  // customer can still file a return. Past this, /api/orders/:id/return
+  // rejects with "Return window of N hours has expired". Apparel
+  // convention is a generous 7-day window (168 hours) — fashion buyers
+  // expect time to try on and decide. Set to 0 to disable returns
+  // entirely (the customer-facing CTA also hides itself when the elapsed
+  // time exceeds this value).
+  return_window_hours        Int      @default(168)
+  // Customer-facing copy explaining the return policy. Surfaced on the
+  // order tracking page near the "Request return" CTA so the customer
+  // knows the rules upfront. Free-form so the admin can phrase it
+  // however the brand prefers; null = "hide the policy line entirely".
+  return_window_message      String?  @db.VarChar(500)
+  // Firm/company geo coordinates and the delivery radius (km). Used by
+  // /api/orders and /api/addresses to reject deliveries outside the area.
+  // Lat/lng nullable so a freshly-seeded install doesn't block orders before
+  // the admin has configured a location; once both are set, the radius is
+  // enforced. Default radius matches BRD: 9 km from firm location.
+  firm_latitude              Decimal? @db.Decimal(10, 7)
+  firm_longitude             Decimal? @db.Decimal(10, 7)
+  delivery_radius_km         Decimal  @default(9) @db.Decimal(8, 2)
+  // Company branding — replaces the hardcoded "Redlook" / "Curated style"
+  // strings across the storefront (navbar, footer, admin shell) and the
+  // seller block on the tax-invoice PDF. Address is free-form multi-line
+  // so the admin can include floor, city, pincode, GSTIN line, etc.
+  // without us imposing a structure.
+  company_name               String   @default("Redlook") @db.VarChar(100)
+  company_tagline            String   @default("Curated style, delivered.") @db.VarChar(100)
+  company_address            String?  @db.VarChar(500)
+  // Admin-editable copy for the four product-detail badges and the home
+  // hero's trust pills. Catalog of badges is fixed by `key`; titles,
+  // subtitles, and visibility are editable. Subtitles support template
+  // tokens — {free_delivery_over} and {next_slot} — resolved on the
+  // storefront. Returns badge stores both variants (returnable + alt for
+  // non-returnable) so the admin can edit either independently.
+  product_detail_badges      Json     @default("[{\"key\":\"delivery\",\"enabled\":true,\"title\":\"Free shipping\",\"subtitle\":\"On orders ₹{free_delivery_over}+\"},{\"key\":\"returns\",\"enabled\":true,\"title\":\"Easy returns\",\"subtitle\":\"Within 7 days of delivery\",\"title_alt\":\"Non-returnable\",\"subtitle_alt\":\"No returns on this item\"},{\"key\":\"freshness\",\"enabled\":true,\"title\":\"100% genuine\",\"subtitle\":\"Authenticity guaranteed\"},{\"key\":\"slot\",\"enabled\":true,\"title\":\"Next slot\",\"subtitle\":\"{next_slot}\"}]")
+  home_hero_features         Json     @default("[{\"key\":\"announcement\",\"enabled\":true,\"title\":\"Free shipping on orders above ₹999\"},{\"key\":\"headline_top\",\"enabled\":true,\"title\":\"Style that turns heads,\"},{\"key\":\"headline_bottom\",\"enabled\":true,\"title\":\"delivered to your door.\"},{\"key\":\"subheadline\",\"enabled\":true,\"title\":\"Hand-picked drops from emerging Indian labels and trusted classics. Easy 7-day returns, no questions asked.\"},{\"key\":\"background_image\",\"enabled\":false,\"title\":\"\"},{\"key\":\"delivery\",\"enabled\":true,\"title\":\"Fast nationwide delivery\"},{\"key\":\"freshness\",\"enabled\":true,\"title\":\"100% genuine guarantee\"},{\"key\":\"speed\",\"enabled\":true,\"title\":\"Checkout in under 2 minutes\"}]")
+  // Pulsing-dot announcement pill at the top of the home hero. Originally
+  // hardcoded as "Free delivery on orders above ₹299"; now admin-editable
+  // alongside the badge / hero-pill copy on the Product details settings
+  // tile. Disabled → pill is hidden entirely.
+  home_announcement_enabled  Boolean  @default(true)
+  home_announcement_text     String   @default("Free shipping on orders above ₹999") @db.VarChar(200)
+  // Credit policy: a customer with any invoice overdue by more than this
+  // many days is blocked from placing further credit orders. BRD §10
+  // calls for a configurable threshold. Set to 0 to disable the gate.
+  credit_overdue_block_days  Int      @default(15)
+  // Storefront "Max price" slider cap. When max_price_filter_auto = true the
+  // public /api/settings response replaces max_price_filter_cap with the
+  // live MAX(price_per_unit) of Active products so the slider always covers
+  // the catalog; the stored cap is the manual override used when auto is
+  // off. Default 150 matches the pre-existing hardcoded value.
+  max_price_filter_auto      Boolean  @default(true)
+  max_price_filter_cap       Decimal  @default(150) @db.Decimal(10, 2)
+  // Platform-wide bulk discount applied on top of category/product discounts.
+  // The resolver picks the largest of (product, category, global-if-enabled),
+  // so this acts as a floor for the whole catalog when enabled. Disabled by
+  // default; admins flip it on for site-wide sales and off to revert with
+  // a single click (no need to zero out every product/category row).
+  global_discount_enabled    Boolean  @default(false)
+  global_discount_percent    Decimal  @default(0) @db.Decimal(5, 2)
+  // Categorywise promotion marquee — admin-managed sale banner row that
+  // scrolls horizontally above the home hero. Each entry: an uploaded
+  // image plus a target category id (clicking the image deep-links to
+  // that category's product listing). Disabled entries stay in the
+  // catalog so the admin can flip a promo back on during the next sale
+  // without re-uploading. Empty array = banner section is hidden on
+  // the storefront. Shape:
+  //   [{ id, image_url, category_id, alt, enabled }]
+  category_promotions        Json     @default("[]")
+  // Per-field translations for admin-editable storefront copy. Flat key
+  // shape so the admin form can iterate without recursive logic:
+  //   { company_name: { hi, bn }, company_tagline: { hi, bn },
+  //     company_address: { hi, bn }, home_announcement_text: { hi, bn },
+  //     return_window_message: { hi, bn }, support_message: { hi, bn },
+  //     hero_<key>: { hi, bn },
+  //     badge_<key>_title: { hi, bn }, badge_<key>_subtitle: { hi, bn } }
+  // Empty/missing locales fall back to the canonical English column.
+  translations               Json?
+  updated_at                 DateTime @updatedAt
+  updated_by                 String?
+}
+
+// ------------------------------------------------------------
+// CREDIT / PAY-LATER (BRD §9 — Credit data model)
+// ------------------------------------------------------------
+
+// One row per customer who has been considered for credit. Singleton via the
+// Customer relation. Existence-with-credit_enabled=false means "admin
+// reviewed and chose not to enable credit"; absence means "never considered".
+model CustomerCreditConfig {
+  customer_id        String   @id
+  customer           Customer @relation(fields: [customer_id], references: [customer_id], onDelete: Cascade)
+  credit_enabled     Boolean  @default(false)
+  // Maximum outstanding (DEBIT minus CREDIT minus payments) the customer
+  // is allowed to carry. Compared against computeCreditState at order
+  // placement / delivery confirmation time.
+  credit_limit       Decimal  @default(0) @db.Decimal(12, 2)
+  // Net days from start_from until due. 7 / 15 / 30 / 45 are common; we
+  // store as a free integer so admins can choose Net 60/90 etc.
+  payment_terms_days Int      @default(30)
+  // Whether the due date counts from the order/invoice date or the
+  // delivery date. BRD §2 lets the admin pick.
+  terms_start_from   String   @default("delivery") @db.VarChar(20)
+  // 'active' (the normal state) or 'blocked' (admin temporarily suspended
+  // credit; existing balances stay, but new credit orders are rejected).
+  status             String   @default("active") @db.VarChar(20)
+  notes              String?  @db.VarChar(1000)
+  created_by         String?  @db.VarChar(150)
+  updated_by         String?  @db.VarChar(150)
+  created_at         DateTime @default(now())
+  updated_at         DateTime @updatedAt
+}
+
+// Append-only ledger of credit movements. DEBIT = order placed on credit
+// (raises outstanding), CREDIT = payment received against an invoice
+// (lowers outstanding), ADJUSTMENT = manual write-off / discount / return.
+// running_balance is materialised at write time so the ledger view doesn't
+// have to re-sum from epoch on every page load.
+//
+// status only applies to DEBIT rows: a DEBIT becomes PARTIALLY_PAID when
+// some of its amount has been allocated, PAID when fully covered, OVERDUE
+// when due_date < today and not fully paid. CREDIT/ADJUSTMENT rows carry
+// status = 'PAID' as a no-op.
+model CreditTransaction {
+  id              String   @id @default(uuid())
+  customer        Customer @relation(fields: [customer_id], references: [customer_id], onDelete: Cascade)
+  customer_id     String
+  // Optional — null for ADJUSTMENT rows that aren't tied to a specific
+  // order (manual write-offs, opening balances, etc.).
+  order           Order?   @relation(fields: [order_id], references: [order_id])
+  order_id        String?
+  type            String   @db.VarChar(15) // DEBIT | CREDIT | ADJUSTMENT
+  amount          Decimal  @db.Decimal(12, 2)
+  amount_paid     Decimal  @default(0) @db.Decimal(12, 2)
+  running_balance Decimal  @db.Decimal(12, 2)
+  // Only meaningful for DEBIT rows. Computed from the customer's
+  // payment_terms_days at the moment the transaction is created.
+  due_date        DateTime?
+  status          String   @default("PENDING") @db.VarChar(20)
+  notes           String?  @db.VarChar(500)
+  created_by      String?  @db.VarChar(150)
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  // Razorpay hosted payment-link ids/urls — populated lazily the first
+  // time the customer clicks "Pay now" on this invoice. Reused on
+  // re-click as long as the link is still active.
+  razorpay_payment_link_id  String? @db.VarChar(50)
+  razorpay_payment_link_url String? @db.VarChar(500)
+
+  @@index([customer_id])
+  @@index([status])
+  @@index([due_date])
+  @@index([razorpay_payment_link_id])
+}
+
+// Each row = one money movement *into* the firm against a credit
+// customer's balance. Settles one or more CreditTransaction(DEBIT) rows
+// via FIFO by default; the resolved allocation is captured in
+// applied_to_invoice_ids so we can audit which invoice each rupee paid.
+model PaymentReceived {
+  id                     String   @id @default(uuid())
+  customer               Customer @relation(fields: [customer_id], references: [customer_id], onDelete: Cascade)
+  customer_id            String
+  amount                 Decimal  @db.Decimal(12, 2)
+  payment_date           DateTime
+  // BANK_TRANSFER | CHEQUE | UPI | CASH | CARD
+  mode                   String   @db.VarChar(20)
+  reference_no           String?  @db.VarChar(100)
+  // JSON array of { credit_transaction_id, applied_amount } — produced
+  // by the FIFO allocator when the payment is recorded. Stored as JSON
+  // so a single payment touching N invoices stays a single row.
+  applied_to_invoice_ids Json
+  notes                  String?  @db.VarChar(500)
+  created_by             String?  @db.VarChar(150)
+  created_at             DateTime @default(now())
+
+  @@index([customer_id])
+  @@index([payment_date])
+}

@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Environment — never commit real values
+.env
+.env.local
+.env.*.local
+.env.production
+
+# Admin-uploaded content (replaced by object storage in production)
+uploads/
+
+# Build / runtime artifacts
+*.log
+*.pid
+*.seed
+dist/
+coverage/
+
+# Test / smoke output
+*.tmp
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

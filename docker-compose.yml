@@ -1,0 +1,28 @@
+# One-command Postgres for Redlook local dev:
+#   docker compose up -d
+# Then set DATABASE_URL in .env to:
+#   postgresql://redlook:redlook@localhost:5433/redlook
+#
+# Port 5433 (not the default 5432) keeps this container from colliding
+# with the FreshKart Postgres that already binds 5432 on this machine.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: redlook-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: redlook
+      POSTGRES_PASSWORD: redlook
+      POSTGRES_DB: redlook
+    ports:
+      - "5433:5432"
+    volumes:
+      - redlook_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U redlook"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  redlook_pgdata:
