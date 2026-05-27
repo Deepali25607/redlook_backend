@@ -66,10 +66,14 @@ async function main() {
 
   console.log('Seeding products…');
   for (const p of PRODUCTS) {
+    // Mirror the legacy single image into the new gallery column so the
+    // detail-page renderer can always read `images` uniformly. Admins
+    // can add 2nd-5th photos via the product form after seed.
+    const withImages = { ...p, images: p.image ? [p.image] : [] };
     await prisma.product.upsert({
       where: { product_id: p.product_id },
-      update: p,
-      create: p,
+      update: withImages,
+      create: withImages,
     });
   }
 

@@ -26,6 +26,13 @@ const createSchema = z.object({
   stock_quantity: z.number().nonnegative(),
   is_organic: z.boolean().optional(),
   image: z.string().min(1).max(500),
+  // Gallery for the product detail page. Max 5 photos — the saree market
+  // norm of front / back / detail / draped / styled. images[0] is mirrored
+  // into `image` server-side so list/cart/order thumbnails (which still
+  // read `image`) keep showing the primary photo without per-route changes.
+  // Empty/omitted = legacy single-image product; the normalizer fills it
+  // from `image` so the detail page can always read `images` uniformly.
+  images: z.array(z.string().min(1).max(500)).max(5).optional(),
   freshness: z.string().max(50).optional().nullable(),
   status: z.enum(['Active', 'Inactive']).optional(),
   // Per-product return eligibility. Defaults to true (everything returnable)
@@ -60,6 +67,12 @@ const adminView = (p) => ({
   stock_quantity: Number(p.stock_quantity),
   is_organic: p.is_organic,
   image: p.image,
+  // Gallery photos. Pre-multi-image rows have empty `images` until an
+  // admin re-saves; fall back to [image] so the edit form always renders
+  // at least the current primary photo in its first slot.
+  images: (Array.isArray(p.images) && p.images.length > 0)
+    ? p.images
+    : (p.image ? [p.image] : []),
   rating: Number(p.rating),
   reviews_count: p.reviews_count,
   freshness: p.freshness,
@@ -75,6 +88,22 @@ const adminView = (p) => ({
 
 const audit = (data) => prisma.auditLog.create({ data })
   .catch((err) => console.error('[audit] failed:', err.message));
+
+// Enforce the images[0] === image invariant before any write so the
+// rest of the app (list cards, cart, order summaries) can keep reading
+// `image` without learning about the gallery.
+//   - admin sent `images`     → image becomes images[0]
+//   - admin sent `image` only → images becomes [image]
+//   - admin sent both         → image is overwritten with images[0] (gallery wins)
+//   - admin sent neither      → no-op (partial update on other fields)
+function normalizeImageFields(body) {
+  if (Array.isArray(body.images) && body.images.length > 0) {
+    body.image = body.images[0];
+  } else if (typeof body.image === 'string' && body.image.length > 0) {
+    body.images = [body.image];
+  }
+  return body;
+}
 
 // ---------------------------------------------------------------
 // GET /api/admin/products — list with filters + paginate + low-stock summary
@@ -148,6 +177,7 @@ router.post('/', requirePermission('products'), validate(createSchema),
       return res.status(403).json({ error: `Your account is not permitted to manage products in category '${req.body.category_id}'` });
     }
 
+    normalizeImageFields(req.body);
     const created = await prisma.product.create({
       data: { ...req.body, product_id: randomUUID() },
       include: { category: true },
@@ -190,6 +220,7 @@ router.put('/:id', requirePermission('products'), validate(updateSchema),
       }
     }
 
+    normalizeImageFields(req.body);
     const updated = await prisma.product.update({
       where: { product_id: req.params.id },
       data: req.body,
@@ -239,5 +270,161 @@ router.delete('/:id', requirePermission('products'), asyncHandler(async (req, re
 
   res.json({ data: adminView(updated) });
 }));
+
+// =================================================================
+// ProductVariant CRUD — nested under /admin/products/:id/variants
+//
+// A product with zero variants behaves as a single SKU (stock on
+// Product.stock_quantity). Once the admin creates ≥1 variant for a
+// product, the storefront switches to a colour-picker UI and per-
+// variant stock is the source of truth.
+//
+// Per the v1 product decisions: each variant MUST carry its own
+// non-empty photo gallery (no fallback to parent product photos).
+// Colour does NOT override price — variants share Product.price_per_unit.
+// =================================================================
+
+const variantHex = z.string().regex(/^#[0-9a-fA-F]{6}$/, 'Hex colour must be #RRGGBB');
+
+const variantCreateSchema = z.object({
+  color:     z.string().min(1).max(60),
+  color_hex: variantHex,
+  stock:     z.number().nonnegative(),
+  // Required, non-empty — Q2 decision: each variant owns its own photos.
+  images:    z.array(z.string().min(1).max(500)).min(1, 'At least one photo is required for each colour').max(5),
+  status:    z.enum(['Active', 'Inactive']).optional(),
+});
+
+const variantUpdateSchema = variantCreateSchema.partial().refine(
+  (d) => Object.keys(d).length > 0,
+  { message: 'No variant fields to update' },
+);
+
+const variantView = (v) => ({
+  variant_id: v.variant_id,
+  product_id: v.product_id,
+  color: v.color,
+  color_hex: v.color_hex,
+  stock: Number(v.stock),
+  images: v.images || [],
+  status: v.status,
+  created_at: v.created_at,
+});
+
+// Guard helper — loads the parent product, enforces category scope, returns it.
+async function loadProductForVariantWrite(req) {
+  const product = await prisma.product.findUnique({ where: { product_id: req.params.id } });
+  if (!product) {
+    notFound('Product not found');
+  }
+  if (!isCategoryInScope(req.admin, product.category_id)) {
+    return { product, denied: true };
+  }
+  return { product, denied: false };
+}
+
+// GET /api/admin/products/:id/variants — list all variants for a product
+router.get('/:id/variants', requirePermission('products'), asyncHandler(async (req, res) => {
+  const product = await prisma.product.findUnique({ where: { product_id: req.params.id } });
+  if (!product) notFound('Product not found');
+  if (!isCategoryInScope(req.admin, product.category_id)) {
+    return res.status(403).json({ error: `Your account is not permitted to manage products in category '${product.category_id}'` });
+  }
+  const variants = await prisma.productVariant.findMany({
+    where: { product_id: req.params.id },
+    orderBy: { created_at: 'asc' },
+  });
+  res.json({ data: variants.map(variantView) });
+}));
+
+// POST /api/admin/products/:id/variants — add a new colour to a product
+router.post('/:id/variants', requirePermission('products'), validate(variantCreateSchema),
+  asyncHandler(async (req, res) => {
+    const { product, denied } = await loadProductForVariantWrite(req);
+    if (denied) {
+      return res.status(403).json({ error: `Your account is not permitted to manage products in category '${product.category_id}'` });
+    }
+    const created = await prisma.productVariant.create({
+      data: { ...req.body, product_id: req.params.id },
+    });
+    audit({
+      action: 'admin.product.variant.create',
+      meta: {
+        product_id: req.params.id,
+        variant_id: created.variant_id,
+        color: created.color,
+        by_admin_id: req.admin.admin_id,
+        by_admin_email: req.admin.email,
+      },
+      ip: req.ip,
+    });
+    res.status(201).json({ data: variantView(created) });
+  }));
+
+// PUT /api/admin/products/:id/variants/:variant_id — edit a colour
+router.put('/:id/variants/:variant_id', requirePermission('products'), validate(variantUpdateSchema),
+  asyncHandler(async (req, res) => {
+    const { product, denied } = await loadProductForVariantWrite(req);
+    if (denied) {
+      return res.status(403).json({ error: `Your account is not permitted to manage products in category '${product.category_id}'` });
+    }
+    const existing = await prisma.productVariant.findUnique({ where: { variant_id: req.params.variant_id } });
+    if (!existing || existing.product_id !== req.params.id) notFound('Variant not found');
+    const updated = await prisma.productVariant.update({
+      where: { variant_id: req.params.variant_id },
+      data: req.body,
+    });
+    audit({
+      action: 'admin.product.variant.update',
+      meta: {
+        product_id: req.params.id,
+        variant_id: updated.variant_id,
+        changes: req.body,
+        by_admin_id: req.admin.admin_id,
+        by_admin_email: req.admin.email,
+      },
+      ip: req.ip,
+    });
+    res.json({ data: variantView(updated) });
+  }));
+
+// DELETE /api/admin/products/:id/variants/:variant_id — remove a colour.
+// Soft-deletes (status='Inactive') if the variant has been referenced by
+// any historical order — otherwise hard-deletes so the admin can re-use
+// the colour name without conflicts.
+router.delete('/:id/variants/:variant_id', requirePermission('products'),
+  asyncHandler(async (req, res) => {
+    const { product, denied } = await loadProductForVariantWrite(req);
+    if (denied) {
+      return res.status(403).json({ error: `Your account is not permitted to manage products in category '${product.category_id}'` });
+    }
+    const existing = await prisma.productVariant.findUnique({ where: { variant_id: req.params.variant_id } });
+    if (!existing || existing.product_id !== req.params.id) notFound('Variant not found');
+
+    const orderRef = await prisma.orderItem.count({ where: { variant_id: req.params.variant_id } });
+    let result;
+    if (orderRef > 0) {
+      result = await prisma.productVariant.update({
+        where: { variant_id: req.params.variant_id },
+        data: { status: 'Inactive' },
+      });
+    } else {
+      await prisma.cartItem.deleteMany({ where: { variant_id: req.params.variant_id } });
+      result = await prisma.productVariant.delete({ where: { variant_id: req.params.variant_id } });
+    }
+    audit({
+      action: orderRef > 0 ? 'admin.product.variant.disable' : 'admin.product.variant.delete',
+      meta: {
+        product_id: req.params.id,
+        variant_id: req.params.variant_id,
+        color: existing.color,
+        order_references: orderRef,
+        by_admin_id: req.admin.admin_id,
+        by_admin_email: req.admin.email,
+      },
+      ip: req.ip,
+    });
+    res.json({ data: { variant_id: req.params.variant_id, soft_deleted: orderRef > 0 } });
+  }));
 
 export default router;

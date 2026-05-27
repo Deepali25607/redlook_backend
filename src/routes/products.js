@@ -38,7 +38,10 @@ router.get('/products', asyncHandler(async (req, res) => {
   const [products, settings] = await Promise.all([
     prisma.product.findMany({
       where,
-      include: { category: true },
+      // variants are included so the list view (cards) can render
+      // colour swatches and the serializer can hide variants the
+      // admin has set to Inactive without an extra round-trip.
+      include: { category: true, variants: { where: { status: 'Active' }, orderBy: { created_at: 'asc' } } },
       orderBy: { created_at: 'desc' },
     }),
     loadSettings(),
@@ -57,7 +60,7 @@ router.get('/products/:id', asyncHandler(async (req, res) => {
   const [product, settings] = await Promise.all([
     prisma.product.findUnique({
       where: { product_id: req.params.id },
-      include: { category: true },
+      include: { category: true, variants: { where: { status: 'Active' }, orderBy: { created_at: 'asc' } } },
     }),
     loadSettings(),
   ]);

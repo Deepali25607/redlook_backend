@@ -196,7 +196,9 @@ model Product {
   unit           String   @db.VarChar(10) // kg / piece / bunch
   stock_quantity Decimal  @default(0) @db.Decimal(10, 2)
   is_organic     Boolean  @default(false)
-  image          String   @db.VarChar(500) // emoji or URL
+  image          String   @db.VarChar(500) // emoji or URL — mirrors images[0] for back-compat with list/cart/order thumbnails
+  // Additional gallery photos for the product detail page (saree front/back/detail/draped/styled). images[0] is kept in sync with the legacy `image` column so list-view code that reads `image` doesn't need to change. Empty array = legacy single-image product.
+  images         String[] @default([])
   rating         Decimal  @default(0) @db.Decimal(3, 2)
   reviews_count  Int      @default(0)
   freshness      String?  @db.VarChar(50)
@@ -222,8 +224,45 @@ model Product {
   cart_items     CartItem[]
   wishlist_items WishlistItem[]
   reviews        Review[]
+  variants       ProductVariant[]
 
   @@index([category_id])
+  @@index([status])
+}
+
+// Per-color (or per-pattern) SKU of a Product. When a product has zero
+// variants the legacy single-SKU behaviour is preserved — stock comes
+// from Product.stock_quantity and cart/order rows leave variant_id null.
+// When at least one variant exists, those rows ARE the inventory: each
+// variant carries its own stock and its own required photo gallery.
+model ProductVariant {
+  variant_id   String   @id @default(uuid())
+  product      Product  @relation(fields: [product_id], references: [product_id], onDelete: Cascade)
+  product_id   String
+  // Display name of the colour ("Crimson Red", "Royal Blue"). Free text
+  // so the admin can also use it for non-colour variants (e.g. "Bordeaux
+  // with gold pallu") without us having to add a separate dimension.
+  color        String   @db.VarChar(60)
+  // Hex code for the swatch button on the customer detail page.
+  // Keep #RRGGBB so the storefront can render it inline as a CSS color
+  // value without parsing. Defaults to a neutral grey when the admin
+  // hasn't picked a colour yet.
+  color_hex    String   @default("#cccccc") @db.VarChar(7)
+  // Independent inventory per colour. Cart-add and checkout decrement
+  // this column (not Product.stock_quantity) whenever variant_id is set.
+  stock        Decimal  @default(0) @db.Decimal(10, 2)
+  // Photos for THIS colour. Required (the gallery contract says each
+  // colour has its own set — no fallback to the parent product's
+  // photos). images[0] is the primary thumbnail shown on swatch hover
+  // and in cart lines.
+  images       String[] @default([])
+  status       String   @default("Active") @db.VarChar(20)
+  created_at   DateTime @default(now())
+
+  order_items  OrderItem[]
+  cart_items   CartItem[]
+
+  @@index([product_id])
   @@index([status])
 }
 
@@ -274,15 +313,24 @@ model Order {
 // 10.5 Order Items (snapshots so future product edits don't change historical orders)
 // ------------------------------------------------------------
 model OrderItem {
-  order_item_id String  @id @default(uuid())
-  order         Order   @relation(fields: [order_id], references: [order_id], onDelete: Cascade)
+  order_item_id String          @id @default(uuid())
+  order         Order           @relation(fields: [order_id], references: [order_id], onDelete: Cascade)
   order_id      String
-  product       Product @relation(fields: [product_id], references: [product_id])
+  product       Product         @relation(fields: [product_id], references: [product_id])
   product_id    String
-  name          String  @db.VarChar(100)
-  image         String  @db.VarChar(500)
-  unit          String  @db.VarChar(10)
-  quantity      Decimal @db.Decimal(10, 2)
+  // Optional FK to the specific colour variant the customer ordered. NULL
+  // for legacy products that don't use variants — the FK is allowed to be
+  // null so historical orders placed before variants existed still
+  // resolve cleanly. The denormalized color column below caches the
+  // display label at order time so an admin renaming or deleting a
+  // variant later never rewrites history.
+  variant       ProductVariant? @relation(fields: [variant_id], references: [variant_id])
+  variant_id    String?
+  color         String?         @db.VarChar(60)
+  name          String          @db.VarChar(100)
+  image         String          @db.VarChar(500)
+  unit          String          @db.VarChar(10)
+  quantity      Decimal         @db.Decimal(10, 2)
   // Pre-discount price at order time. unit_price is what the customer was
   // charged (post-discount); mrp is the original sticker price. Together
   // they let invoices and order-history pages show "you saved Rs. X" with
@@ -308,14 +356,20 @@ model Cart {
 }
 
 model CartItem {
-  cart_item_id String  @id @default(uuid())
-  cart         Cart    @relation(fields: [cart_id], references: [cart_id], onDelete: Cascade)
+  cart_item_id String          @id @default(uuid())
+  cart         Cart            @relation(fields: [cart_id], references: [cart_id], onDelete: Cascade)
   cart_id      String
-  product      Product @relation(fields: [product_id], references: [product_id])
+  product      Product         @relation(fields: [product_id], references: [product_id])
   product_id   String
-  qty          Decimal @db.Decimal(10, 2)
+  // Same shape as OrderItem.variant_id — nullable so legacy single-SKU
+  // products keep working with no migration of customer carts. The
+  // (cart, product, variant) tuple is deduped in app code on add-to-
+  // cart so we don't need a partial unique index over a nullable column.
+  variant      ProductVariant? @relation(fields: [variant_id], references: [variant_id])
+  variant_id   String?
+  qty          Decimal         @db.Decimal(10, 2)
 
-  @@unique([cart_id, product_id])
+  @@index([cart_id, product_id])
 }
 
 // ------------------------------------------------------------

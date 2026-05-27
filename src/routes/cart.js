@@ -15,6 +15,11 @@ router.use(requireAuth);
 
 const addItemSchema = z.object({
   product_id: z.string().min(1),
+  // Required when the product has 1+ active variants; ignored when
+  // it doesn't. The route enforces both branches and returns 400 if
+  // the customer tries to add a multi-variant product without picking
+  // a colour, or picks a colour that belongs to a different product.
+  variant_id: z.string().min(1).optional(),
   qty: z.number().positive(),
 });
 const updateItemSchema = z.object({ qty: z.number().nonnegative() });
@@ -25,9 +30,10 @@ async function getOrCreateCart(customerId) {
     where: { customer_id: customerId },
     update: {},
     create: { customer_id: customerId },
-    // Category include is required so the pricing resolver can apply
-    // category-level discounts to each line.
-    include: { items: { include: { product: { include: { category: true } } } } },
+    // Category is required so the pricing resolver can apply category-
+    // level discounts. variant lets the cart serializer surface colour
+    // name + per-variant image without an extra round-trip.
+    include: { items: { include: { product: { include: { category: true, variants: { where: { status: 'Active' } } } }, variant: true } } },
   });
 }
 
@@ -42,10 +48,23 @@ async function loadSettings() {
 function serializeCart(cart, settings, locale) {
   const items = cart.items.map((ci) => {
     const { price } = resolveProductPrice(ci.product, ci.product.category, settings);
+    // When a variant is selected, prefer its primary photo so cart
+    // line thumbnails show the colour the customer actually picked,
+    // not the parent product's default photo.
+    const variantImage = ci.variant && Array.isArray(ci.variant.images) && ci.variant.images.length > 0
+      ? ci.variant.images[0]
+      : null;
     return {
       cart_item_id: ci.cart_item_id,
       qty: Number(ci.qty),
       product: serializeProduct(ci.product, settings, locale),
+      // Flat variant fields keep the cart-line UI dumb — it doesn't
+      // need to traverse product.variants[] to find which colour to
+      // show next to the product name.
+      variant_id: ci.variant_id,
+      variant_color: ci.variant?.color || null,
+      variant_color_hex: ci.variant?.color_hex || null,
+      variant_image: variantImage,
       line_total: Number(ci.qty) * price,
     };
   });
@@ -63,18 +82,59 @@ router.get('/', asyncHandler(async (req, res) => {
 }));
 
 // POST /api/cart/items
+// Variant rules (enforced server-side so the storefront can't bypass them):
+//   - Product with 0 active variants → variant_id must be absent.
+//                                      Stock check hits product.stock_quantity.
+//   - Product with 1+ active variants → variant_id is REQUIRED.
+//                                       Stock check hits the chosen variant's
+//                                       stock; product.stock_quantity is ignored.
+// Dedup of (cart, product, variant) is done explicitly because the old
+// unique constraint was dropped (different colours of the same product
+// need to live as separate cart lines).
 router.post('/items', validate(addItemSchema), asyncHandler(async (req, res) => {
-  const { product_id, qty } = req.body;
-  const product = await prisma.product.findUnique({ where: { product_id } });
+  const { product_id, variant_id, qty } = req.body;
+  const product = await prisma.product.findUnique({
+    where: { product_id },
+    include: { variants: { where: { status: 'Active' } } },
+  });
   if (!product) notFound('Product not found');
-  if (Number(product.stock_quantity) < qty) badRequest('Insufficient stock');
+
+  const hasVariants = product.variants.length > 0;
+  if (hasVariants && !variant_id) {
+    badRequest('This product comes in multiple colours — please select one.');
+  }
+  if (!hasVariants && variant_id) {
+    badRequest('This product does not support colour variants.');
+  }
+
+  let variant = null;
+  if (variant_id) {
+    variant = product.variants.find((v) => v.variant_id === variant_id);
+    if (!variant) badRequest('Selected colour is no longer available for this product.');
+    if (Number(variant.stock) < qty) badRequest(`Only ${Number(variant.stock)} of this colour in stock`);
+  } else {
+    if (Number(product.stock_quantity) < qty) badRequest('Insufficient stock');
+  }
 
   const cart = await getOrCreateCart(req.user.customer_id);
-  await prisma.cartItem.upsert({
-    where: { cart_id_product_id: { cart_id: cart.cart_id, product_id } },
-    update: { qty: { increment: qty } },
-    create: { cart_id: cart.cart_id, product_id, qty },
+  // Dedup: increment qty when the exact (product, variant) combo is
+  // already in the cart, otherwise insert a new line. findFirst (not
+  // findUnique) because the unique key was dropped to allow multiple
+  // colour-variants of the same product to coexist in a cart.
+  const existing = await prisma.cartItem.findFirst({
+    where: { cart_id: cart.cart_id, product_id, variant_id: variant_id ?? null },
   });
+  if (existing) {
+    await prisma.cartItem.update({
+      where: { cart_item_id: existing.cart_item_id },
+      data: { qty: { increment: qty } },
+    });
+  } else {
+    await prisma.cartItem.create({
+      data: { cart_id: cart.cart_id, product_id, variant_id: variant_id ?? null, qty },
+    });
+  }
+
   const [updated, settings] = await Promise.all([
     getOrCreateCart(req.user.customer_id),
     loadSettings(),

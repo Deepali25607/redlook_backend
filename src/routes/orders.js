@@ -30,6 +30,10 @@ const placeOrderSchema = z.object({
   coupon_code: z.string().optional().nullable(),
   items: z.array(z.object({
     product_id: z.string().min(1),
+    // Required when the product has 1+ active variants; rejected when it
+    // doesn't. Validated inline below so we can return a helpful error
+    // message naming the product, not a generic Zod failure.
+    variant_id: z.string().min(1).optional(),
     qty: z.number().positive(),
   })).min(1),
   // Optional live-location override sent by checkout's "Share live
@@ -186,7 +190,10 @@ router.post('/', validate(placeOrderSchema), asyncHandler(async (req, res) => {
     const productIds = items.map((i) => i.product_id);
     const products = await tx.product.findMany({
       where: { product_id: { in: productIds } },
-      include: { category: true },
+      // Include variants so per-colour stock can be checked and the
+      // matching variant's photo + colour name snapshotted onto the
+      // OrderItem at order time.
+      include: { category: true, variants: { where: { status: 'Active' } } },
     });
     const productMap = Object.fromEntries(products.map((p) => [p.product_id, p]));
 
@@ -197,15 +204,41 @@ router.post('/', validate(placeOrderSchema), asyncHandler(async (req, res) => {
       const p = productMap[i.product_id];
       if (!p) badRequest(`Product ${i.product_id} not found`);
       if (p.status !== 'Active') badRequest(`${p.name} is not available`);
-      if (Number(p.stock_quantity) < i.qty) badRequest(`${p.name} only has ${p.stock_quantity} ${p.unit} in stock`);
+
+      // Branch on whether the product is variant-mode or single-SKU.
+      // Variant-mode products: stock check + photo + colour come from
+      // the selected variant. Single-SKU products keep their legacy
+      // path (product.stock_quantity, product.image, color=null).
+      const hasVariants = p.variants.length > 0;
+      let variantRow = null;
+      let lineImage = p.image;
+      let lineColor = null;
+      if (hasVariants) {
+        if (!i.variant_id) badRequest(`${p.name} comes in multiple colours — please pick one before placing the order.`);
+        variantRow = p.variants.find((v) => v.variant_id === i.variant_id);
+        if (!variantRow) badRequest(`Selected colour is no longer available for ${p.name}.`);
+        if (Number(variantRow.stock) < i.qty) {
+          badRequest(`${p.name} (${variantRow.color}) only has ${Number(variantRow.stock)} ${p.unit} in stock`);
+        }
+        lineImage = (Array.isArray(variantRow.images) && variantRow.images.length > 0) ? variantRow.images[0] : p.image;
+        lineColor = variantRow.color;
+      } else {
+        if (i.variant_id) badRequest(`${p.name} does not support colour variants.`);
+        if (Number(p.stock_quantity) < i.qty) badRequest(`${p.name} only has ${p.stock_quantity} ${p.unit} in stock`);
+      }
+
       const { price: unitPrice, mrp } = resolveProductPrice(p, p.category, settings);
       const lineTotal = unitPrice * i.qty;
       subtotal += lineTotal;
       totalQuantity += Number(i.qty);
       orderItems.push({
         product_id: p.product_id,
+        variant_id: variantRow?.variant_id || null,
+        // Snapshot the colour name onto the OrderItem so renaming or
+        // deleting a variant later doesn't rewrite invoice history.
+        color: lineColor,
         name: p.name,
-        image: p.image,
+        image: lineImage,
         unit: p.unit,
         quantity: i.qty,
         // Snapshot the MRP alongside unit_price so the invoice and order
@@ -360,12 +393,23 @@ router.post('/', validate(placeOrderSchema), asyncHandler(async (req, res) => {
       });
     }
 
-    // 7. Decrement stock
+    // 7. Decrement stock — variant stock when the line has a colour,
+    //    legacy product.stock_quantity when it doesn't. Variant-mode
+    //    products leave product.stock_quantity untouched so the admin
+    //    can see "did this colour just sell out" without that number
+    //    drifting from the sum of variant stocks.
     for (const i of orderItems) {
-      await tx.product.update({
-        where: { product_id: i.product_id },
-        data: { stock_quantity: { decrement: i.quantity } },
-      });
+      if (i.variant_id) {
+        await tx.productVariant.update({
+          where: { variant_id: i.variant_id },
+          data: { stock: { decrement: i.quantity } },
+        });
+      } else {
+        await tx.product.update({
+          where: { product_id: i.product_id },
+          data: { stock_quantity: { decrement: i.quantity } },
+        });
+      }
     }
 
     // 8. Record per-customer coupon redemption — the unique index on

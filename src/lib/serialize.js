@@ -40,6 +40,28 @@ export function serializeProduct(p, settings = null, locale = DEFAULT_LOCALE) {
     stock: toNumber(p.stock_quantity),
     isOrganic: p.is_organic,
     image: p.image,
+    // Gallery URLs shown on the product detail page. Falls back to
+    // [image] for pre-multi-image rows so the detail-page renderer can
+    // always treat `images` as the source of truth without a null check.
+    images: (Array.isArray(p.images) && p.images.length > 0)
+      ? p.images
+      : (p.image ? [p.image] : []),
+    // Colour variants (when present). Each one is a distinct SKU with
+    // its own stock and required photo gallery. Inactive variants are
+    // filtered out so the storefront never offers a colour the admin
+    // has retired. Products without variants serialise this as [] and
+    // the storefront falls back to the single-SKU flow.
+    variants: Array.isArray(p.variants)
+      ? p.variants
+          .filter((v) => v.status !== 'Inactive')
+          .map((v) => ({
+            variant_id: v.variant_id,
+            color: v.color,
+            color_hex: v.color_hex,
+            stock: toNumber(v.stock),
+            images: v.images || [],
+          }))
+      : [],
     rating: toNumber(p.rating),
     reviews: p.reviews_count,
     freshness: localize(p, 'freshness', locale),
