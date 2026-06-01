@@ -34,14 +34,44 @@ import { prisma } from './prisma.js';
 // null when USER_EMAIL / USER_PASSWORD aren't set so sendEmail() can fall
 // back to the console (dev) instead of throwing. USER_PASSWORD must be a
 // Gmail *App Password* (16 chars), not the account login password.
+//
+// On a host like Render these vars must be set in the dashboard Environment
+// — a local .env is NOT deployed (it's gitignored). If they're missing the
+// transporter stays null and sendEmail() reports the misconfiguration loudly
+// instead of pretending the mail went out.
 let _mailer;
 function getMailer() {
   if (_mailer !== undefined) return _mailer;
   const user = process.env.USER_EMAIL;
   const pass = process.env.USER_PASSWORD;
-  _mailer = (user && pass)
-    ? nodemailer.createTransport({ service: 'gmail', auth: { user, pass } })
-    : null;
+  if (!user || !pass) {
+    console.warn('[notify:email] USER_EMAIL / USER_PASSWORD are not set — emails will NOT be sent. On Render, add them under Settings → Environment and redeploy.');
+    _mailer = null;
+    return _mailer;
+  }
+  _mailer = nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true,
+    // App Password may be pasted with the spaces Google shows ("dmrl hicy …");
+    // strip them so auth doesn't fail on a stray space.
+    auth: { user, pass: pass.replace(/\s+/g, '') },
+    // Fail fast instead of hanging forever when outbound SMTP is blocked
+    // (Render blocks ports 25/465/587 on many plans). A hang would stall
+    // the fire-and-forget notify task and leak sockets.
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 20_000,
+  });
+  // One-time connectivity probe. Its result lands in the Render logs and
+  // tells you which failure you have:
+  //   "Gmail SMTP ready"            → working
+  //   EAUTH / invalid login         → wrong USER_EMAIL/USER_PASSWORD
+  //   ETIMEDOUT / ECONNREFUSED      → host is blocking outbound SMTP
+  //                                   (switch to an HTTP email API)
+  _mailer.verify()
+    .then(() => console.log(`[notify:email] Gmail SMTP ready as ${user}`))
+    .catch((err) => console.error(`[notify:email] Gmail SMTP NOT reachable: ${err.code || ''} ${err.message}. If this is a timeout on Render, outbound SMTP is blocked — use an HTTP email API (SendGrid/Resend/Brevo) instead.`));
   return _mailer;
 }
 
@@ -211,24 +241,93 @@ function renderTemplate(templateName, locale, data) {
   };
 }
 
-async function sendEmail({ to, subject, body }) {
-  const mailer = getMailer();
-  // No Gmail credentials configured → dev console fallback (unchanged behaviour).
-  if (!mailer) {
-    console.log(`[notify:email] (dev, no USER_EMAIL/USER_PASSWORD) → ${to}\n  Subject: ${subject}\n  ${body.replace(/\n/g, '\n  ')}`);
-    return { provider: 'console', sent: true };
-  }
+// ── HTTP email providers ─────────────────────────────────────────────
+// These talk to the provider over HTTPS (port 443), which is never blocked
+// — unlike SMTP (ports 25/465/587), which Render blocks on most plans. So
+// on Render these work where Gmail SMTP times out. Whichever API key is
+// present is used in preference to Gmail SMTP (see sendEmail below).
+
+// Brevo (formerly Sendinblue). Recommended for this project: its free tier
+// (300 emails/day) lets you verify a SINGLE sender address — e.g. your Gmail
+// — without owning a domain, and then mail any recipient. Set BREVO_API_KEY,
+// and BREVO_SENDER (defaults to USER_EMAIL) must be a Verified Sender in the
+// Brevo dashboard.
+async function sendEmailViaBrevo({ to, subject, body }) {
+  const senderEmail = process.env.BREVO_SENDER || process.env.USER_EMAIL;
   try {
-    await mailer.sendMail({
-      from: `Redlook <${process.env.USER_EMAIL}>`,
-      to,
-      subject: subject || 'Redlook',
-      text: body,
+    const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({
+        sender: { name: 'Redlook', email: senderEmail },
+        to: [{ email: to }],
+        subject: subject || 'Redlook',
+        textContent: body,
+      }),
     });
-    return { provider: 'gmail', sent: true };
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = json.message || `Brevo returned ${res.status}`;
+      console.error(`[notify:email] Brevo send to ${to} failed: ${msg}`);
+      return { provider: 'brevo', sent: false, error: msg };
+    }
+    return { provider: 'brevo', sent: true };
   } catch (err) {
-    return { provider: 'gmail', sent: false, error: err.message };
+    console.error(`[notify:email] Brevo send to ${to} failed: ${err.message}`);
+    return { provider: 'brevo', sent: false, error: err.message };
   }
+}
+
+// Resend. Also HTTPS-based, but its free tier requires a VERIFIED DOMAIN to
+// mail arbitrary recipients — without one, RESEND_FROM must be
+// onboarding@resend.dev, which can only reach your own Resend account email.
+// Supported here for completeness; prefer Brevo if you only have a Gmail.
+async function sendEmailViaResend({ to, subject, body }) {
+  const from = process.env.RESEND_FROM || 'Redlook <onboarding@resend.dev>';
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ from, to, subject: subject || 'Redlook', text: body }),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = json.message || `Resend returned ${res.status}`;
+      console.error(`[notify:email] Resend send to ${to} failed: ${msg}`);
+      return { provider: 'resend', sent: false, error: msg };
+    }
+    return { provider: 'resend', sent: true };
+  } catch (err) {
+    console.error(`[notify:email] Resend send to ${to} failed: ${err.message}`);
+    return { provider: 'resend', sent: false, error: err.message };
+  }
+}
+
+async function sendEmail({ to, subject, body }) {
+  // 1. HTTP email API (works on Render — SMTP-port-blocking can't affect it).
+  if (process.env.BREVO_API_KEY)  return sendEmailViaBrevo({ to, subject, body });
+  if (process.env.RESEND_API_KEY) return sendEmailViaResend({ to, subject, body });
+
+  // 2. Gmail SMTP — ideal for local dev; blocked on Render and similar hosts.
+  const mailer = getMailer();
+  if (mailer) {
+    try {
+      await mailer.sendMail({ from: `Redlook <${process.env.USER_EMAIL}>`, to, subject: subject || 'Redlook', text: body });
+      return { provider: 'gmail', sent: true };
+    } catch (err) {
+      console.error(`[notify:email] Gmail send to ${to} failed: ${err.code || ''} ${err.message}`);
+      return { provider: 'gmail', sent: false, error: err.message };
+    }
+  }
+
+  // 3. Nothing configured. In production, surface the misconfiguration as a
+  // real failure (don't let the OTP silently vanish like it did on Render).
+  if (process.env.NODE_ENV === 'production') {
+    console.error(`[notify:email] cannot send to ${to} — no email provider configured (set BREVO_API_KEY, RESEND_API_KEY, or USER_EMAIL/USER_PASSWORD).`);
+    return { provider: 'none', sent: false, error: 'No email provider configured on the server' };
+  }
+  console.log(`[notify:email] (dev, no provider) → ${to}\n  Subject: ${subject}\n  ${body.replace(/\n/g, '\n  ')}`);
+  return { provider: 'console', sent: true };
 }
 
 // MSG91 v5 OTP API. Used for the auth.phone_verification template only —

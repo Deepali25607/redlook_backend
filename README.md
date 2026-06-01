@@ -126,3 +126,9 @@ docker compose down
 # Wipe the DB completely (irreversible)
 docker compose down -v
 ```
+
+
+app password
+dmrl hicy uvqi xfns
+
+imdeepali14@gmail.com
