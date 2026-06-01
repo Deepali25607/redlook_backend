@@ -23,8 +23,10 @@
     "dotenv": "^16.4.5",
     "exceljs": "^4.4.0",
     "express": "^4.21.1",
+    "firebase-admin": "^13.0.2",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.1.1",
+    "nodemailer": "^8.0.10",
     "pdfkit": "^0.18.0",
     "razorpay": "^2.9.6",
     "zod": "^3.23.8"

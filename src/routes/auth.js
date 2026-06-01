@@ -9,6 +9,7 @@ import { asyncHandler, validate, badRequest, conflict, notFound, unauthorized, H
 import { serializeUser } from '../lib/serialize.js';
 import { notify } from '../lib/notify.js';
 import { validateEmailHasMx } from '../lib/emailValidation.js';
+import { verifyFirebasePhoneToken } from '../lib/firebase.js';
 
 // Fire-and-forget wrapper — notify() must never break the user-facing response.
 const fireNotify = (args) => notify(args).catch((err) => console.error('[notify] failed:', err.message));
@@ -63,7 +64,7 @@ async function issuePhoneOtp(customer) {
   });
   fireNotify({
     template: 'auth.phone_verification',
-    to: { phone: customer.phone, customer_id: customer.customer_id },
+    to: { phone: customer.phone, email: customer.email, customer_id: customer.customer_id },
     data: { otp, ttl_minutes: PHONE_OTP_TTL_MINUTES },
   });
   return otp;
@@ -86,7 +87,7 @@ async function issuePhoneOtpForPending(pending) {
   });
   fireNotify({
     template: 'auth.phone_verification',
-    to: { phone: pending.phone },
+    to: { phone: pending.phone, email: pending.email },
     data: { otp, ttl_minutes: PHONE_OTP_TTL_MINUTES },
   });
   return otp;
@@ -202,10 +203,11 @@ router.post('/register', validate(registerSchema), asyncHandler(async (req, res)
     },
   });
 
-  // Fire-and-forget SMS — never blocks the response on provider latency.
+  // Fire-and-forget — never blocks the response on provider latency. Emails
+  // the OTP (Gmail/Nodemailer) and, if MSG91 is configured, also SMSes it.
   fireNotify({
     template: 'auth.phone_verification',
-    to: { phone: pending.phone },
+    to: { phone: pending.phone, email: pending.email },
     data: { otp, ttl_minutes: PHONE_OTP_TTL_MINUTES },
   });
 
@@ -416,7 +418,7 @@ router.post('/login', validate(loginSchema), asyncHandler(async (req, res) => {
   // re-enter their phone. The 403 + structured `code` lets the FE
   // distinguish this from a generic auth error and show a "verify now" CTA.
   if (!user.phone_verified) {
-    throw new HttpError(403, 'Please verify your phone before signing in. We sent a code by SMS.', {
+    throw new HttpError(403, 'Please verify your account before signing in. Tap Resend on the next screen to get a code by email.', {
       code: 'PHONE_NOT_VERIFIED',
       customer_id: user.customer_id,
       phone: user.phone,
@@ -587,6 +589,153 @@ router.post('/reset-password', validate(resetSchema), asyncHandler(async (req, r
   // Invalidate all existing sessions on password change.
   await prisma.session.deleteMany({ where: { customer_id: payload.sub } });
   res.json({ data: { ok: true } });
+}));
+
+// ============================================================
+// Firebase Phone Auth endpoints — additive, opt-in via frontend
+// flag. The MSG91-backed /register, /login, /verify-otp,
+// /forgot-password, /verify-reset-otp endpoints above keep working
+// untouched so a Firebase outage or a flag flip can revert the
+// storefront to the legacy SMS flow without any backend change.
+//
+// All three endpoints accept a Firebase ID token in `idToken`,
+// verify it with the Admin SDK, and trust the `phone_number` claim
+// on it as proof of phone ownership. Firebase returns the phone in
+// E.164 (e.g. "+919876543210") — we strip the +91 prefix to keep
+// the 10-digit format that Customer.phone has used since day one.
+// ============================================================
+
+// Firebase tokens carry verified phones in E.164. Our DB and the
+// existing registerSchema expect 10-digit Indian mobiles. Normalise
+// here so both providers feed the same shape into Customer.phone.
+function normalizeIndianPhone(e164) {
+  const stripped = e164.replace(/^\+91/, '');
+  if (!/^[6-9]\d{9}$/.test(stripped)) {
+    badRequest('Only Indian mobile numbers (+91, starting 6–9) are supported.');
+  }
+  return stripped;
+}
+
+const firebaseLoginSchema = z.object({ idToken: z.string().min(1) });
+
+// POST /auth/firebase-login — passwordless login via a verified
+// Firebase phone token. Finds the existing Customer by phone and
+// issues a session JWT. 404 when no account exists (so the
+// storefront can route to the register flow).
+router.post('/firebase-login', validate(firebaseLoginSchema), asyncHandler(async (req, res) => {
+  let phone;
+  try {
+    ({ phone } = await verifyFirebasePhoneToken(req.body.idToken));
+  } catch (err) {
+    return res.status(err.status || 401).json({ error: err.message || 'Firebase token verification failed' });
+  }
+  const tenDigit = normalizeIndianPhone(phone);
+
+  const user = await prisma.customer.findFirst({ where: { phone: tenDigit } });
+  if (!user) notFound('No account found for this phone number. Please register first.');
+
+  // Flip phone_verified back on (in case an admin had reset it) and
+  // bump last_login so the dashboard's "last seen" stays current.
+  const updated = await prisma.customer.update({
+    where: { customer_id: user.customer_id },
+    data: { last_login: new Date(), phone_verified: true },
+  });
+  const token = await issueSession(updated.customer_id);
+  res.json({ data: { user: serializeUser(updated), token } });
+}));
+
+const firebaseRegisterSchema = z.object({
+  idToken: z.string().min(1),
+  full_name: z.string().min(2).max(100),
+  email: z.string().email().max(150),
+  password: passwordRule,
+  date_of_birth: z.string().optional().nullable(),
+  gender: z.string().optional().nullable(),
+});
+
+// POST /auth/firebase-register — single-step registration. Phone is
+// already verified by Firebase, so we skip the PendingRegistration
+// dance entirely and create the Customer in one shot.
+router.post('/firebase-register', validate(firebaseRegisterSchema), asyncHandler(async (req, res) => {
+  const { idToken, full_name, email, password, date_of_birth, gender } = req.body;
+
+  let phone;
+  try {
+    ({ phone } = await verifyFirebasePhoneToken(idToken));
+  } catch (err) {
+    return res.status(err.status || 401).json({ error: err.message || 'Firebase token verification failed' });
+  }
+  const tenDigit = normalizeIndianPhone(phone);
+
+  // Same hygiene as the MSG91 /register path so the email check stays
+  // consistent across providers (catches misspelled domains, etc.).
+  await validateEmailHasMx(email);
+
+  const collision = await prisma.customer.findFirst({
+    where: { OR: [{ email }, { phone: tenDigit }] },
+  });
+  if (collision) {
+    if (collision.email === email) conflict('Email already registered');
+    if (collision.phone === tenDigit) conflict('Phone already registered');
+  }
+
+  const created = await prisma.customer.create({
+    data: {
+      full_name,
+      email,
+      phone: tenDigit,
+      password_hash: await bcrypt.hash(password, 10),
+      date_of_birth: date_of_birth || null,
+      gender: gender || null,
+      // Firebase already verified the phone — flip the column so the
+      // post-signup phone-change re-verify flow doesn't kick in.
+      phone_verified: true,
+      notification_prefs: { email: true, sms: true, push: false },
+      last_login: new Date(),
+    },
+  });
+
+  fireNotify({
+    template: 'auth.welcome',
+    to: { email: created.email, customer_id: created.customer_id },
+    data: { full_name: created.full_name },
+  });
+
+  const token = await issueSession(created.customer_id);
+  res.json({ data: { user: serializeUser(created), token } });
+}));
+
+const firebaseResetSchema = z.object({
+  idToken: z.string().min(1),
+  new_password: passwordRule,
+});
+
+// POST /auth/firebase-reset-password — forgot-password flow via
+// Firebase. Customer verifies phone ownership through the client SDK
+// and we update password_hash directly. All existing sessions are
+// invalidated, matching the legacy /reset-password behaviour.
+router.post('/firebase-reset-password', validate(firebaseResetSchema), asyncHandler(async (req, res) => {
+  let phone;
+  try {
+    ({ phone } = await verifyFirebasePhoneToken(req.body.idToken));
+  } catch (err) {
+    return res.status(err.status || 401).json({ error: err.message || 'Firebase token verification failed' });
+  }
+  const tenDigit = normalizeIndianPhone(phone);
+
+  const user = await prisma.customer.findFirst({ where: { phone: tenDigit } });
+  if (!user) notFound('No account found for this phone number.');
+
+  await prisma.customer.update({
+    where: { customer_id: user.customer_id },
+    data: { password_hash: await bcrypt.hash(req.body.new_password, 10) },
+  });
+  await prisma.session.deleteMany({ where: { customer_id: user.customer_id } });
+
+  // Issue a fresh session so the customer is logged in on the device
+  // they just reset from — saves them an immediate second sign-in.
+  const token = await issueSession(user.customer_id);
+  res.json({ data: { ok: true, user: serializeUser(user), token } });
 }));
 
 export default router;

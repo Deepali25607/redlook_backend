@@ -27,7 +27,23 @@
 // d.order_id, d.total, etc.) work in every locale — only the strings
 // change.
 
+import nodemailer from 'nodemailer';
 import { prisma } from './prisma.js';
+
+// Lazy Gmail transporter — built once on first email, reused after. Returns
+// null when USER_EMAIL / USER_PASSWORD aren't set so sendEmail() can fall
+// back to the console (dev) instead of throwing. USER_PASSWORD must be a
+// Gmail *App Password* (16 chars), not the account login password.
+let _mailer;
+function getMailer() {
+  if (_mailer !== undefined) return _mailer;
+  const user = process.env.USER_EMAIL;
+  const pass = process.env.USER_PASSWORD;
+  _mailer = (user && pass)
+    ? nodemailer.createTransport({ service: 'gmail', auth: { user, pass } })
+    : null;
+  return _mailer;
+}
 
 // English (canonical) bodies. These have always been here; they keep their
 // exact wording. Anywhere a locale-specific stub returns null/empty, the
@@ -42,11 +58,12 @@ const en = {
   // Sent at registration AND every resend AND every time the customer
   // changes their phone in profile. The OTP is the single thing gating
   // account activation + checkout — both are blocked until this is consumed.
-  // SMS-only; we don't echo the code by email so a stolen email account
-  // can't pivot to a verified phone.
+  // Delivered by email (Gmail/Nodemailer) so signup can be tested without
+  // SMS billing; the SMS body is kept for when MSG91 is wired back on. The
+  // dispatcher only sends whichever channel(s) the `to` object provides.
   'auth.phone_verification': (d) => ({
-    subject: null,
-    email: null,
+    subject: `Redlook verification code: ${d.otp}`,
+    email: `Your Redlook verification code is ${d.otp}.\n\nIt is valid for ${d.ttl_minutes} minutes. Do not share this code with anyone.\n\nIf you did not request this, you can ignore this email.`,
     sms: `Redlook verification code: ${d.otp}. Valid for ${d.ttl_minutes} minutes. Do not share with anyone.`,
   }),
   'auth.password_reset': (d) => ({
@@ -195,13 +212,23 @@ function renderTemplate(templateName, locale, data) {
 }
 
 async function sendEmail({ to, subject, body }) {
-  if (!process.env.SENDGRID_API_KEY) {
-    console.log(`[notify:email] (dev) → ${to}\n  Subject: ${subject}\n  ${body.replace(/\n/g, '\n  ')}`);
+  const mailer = getMailer();
+  // No Gmail credentials configured → dev console fallback (unchanged behaviour).
+  if (!mailer) {
+    console.log(`[notify:email] (dev, no USER_EMAIL/USER_PASSWORD) → ${to}\n  Subject: ${subject}\n  ${body.replace(/\n/g, '\n  ')}`);
     return { provider: 'console', sent: true };
   }
-  // TODO: real SendGrid call via fetch when SENDGRID_API_KEY is configured.
-  // No SDK dependency until then — keeps node_modules slim.
-  return { provider: 'sendgrid', sent: false, error: 'sendgrid adapter not implemented' };
+  try {
+    await mailer.sendMail({
+      from: `Redlook <${process.env.USER_EMAIL}>`,
+      to,
+      subject: subject || 'Redlook',
+      text: body,
+    });
+    return { provider: 'gmail', sent: true };
+  } catch (err) {
+    return { provider: 'gmail', sent: false, error: err.message };
+  }
 }
 
 // MSG91 v5 OTP API. Used for the auth.phone_verification template only —
