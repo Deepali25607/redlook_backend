@@ -161,6 +161,10 @@ router.get('/settings', asyncHandler(async (req, res) => {
       // rendering; we ship the full catalog so a disabled-but-saved
       // entry can be flipped back on without re-uploading.
       category_promotions: s.category_promotions || [],
+      // Frequently-Bought-Together rules. Storefront filters by `enabled` and
+      // matches a rule's trigger_category_id against the just-added product's
+      // category to decide whether to show the Suggested items modal.
+      cross_sell_rules: s.cross_sell_rules || [],
       // Resolved cap the slider should render with. Raw fields stay
       // internal — the admin form fetches them from the authenticated
       // endpoint where it can edit them.

@@ -188,6 +188,37 @@ const categoryPromosSchema = z.array(categoryPromoSchema)
     }
   });
 
+// Frequently-Bought-Together / cross-sell rules. Each rule fires when a
+// customer adds a product from `trigger_category_id`, popping a suggestions
+// modal listing `product_ids`. Like the promo marquee, `trigger_category_id`
+// and `product_ids` are NOT FK-validated server-side — admins routinely wire
+// rules before a category is renamed/seeded, and the storefront simply skips
+// any id it can't resolve (or hides the modal if nothing resolves). Caps keep
+// the JSON blob and the modal a sane size.
+const crossSellRuleSchema = z.object({
+  id: z.string().min(1).max(60),
+  trigger_category_id: z.string().min(1).max(60),
+  title: z.string().max(80).optional().nullable(),
+  subtitle: z.string().max(140).optional().nullable(),
+  product_ids: z.array(z.string().min(1).max(60)).max(12, 'Up to 12 suggested products per rule'),
+  enabled: z.boolean(),
+});
+const crossSellRulesSchema = z.array(crossSellRuleSchema)
+  .max(30, 'Maximum 30 cross-sell rules')
+  .superRefine((arr, ctx) => {
+    const seen = new Set();
+    for (let i = 0; i < arr.length; i++) {
+      if (seen.has(arr[i].id)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [i, 'id'],
+          message: `Duplicate rule id "${arr[i].id}"`,
+        });
+      }
+      seen.add(arr[i].id);
+    }
+  });
+
 const updateSchema = z.object({
   // Decimal cap matches Decimal(10, 2) — 99,999,999.99 max — but a sane upper
   // bound here helps catch fat-finger errors before they hit checkout.
@@ -239,6 +270,8 @@ const updateSchema = z.object({
   delivery_slots: deliverySlotsSchema,
   // Sale-promo marquee row scrolling above the storefront hero.
   category_promotions: categoryPromosSchema,
+  // Frequently-Bought-Together cross-sell rules (Suggested items modal).
+  cross_sell_rules: crossSellRulesSchema,
   // Storefront "Max price" filter cap. When auto, the manual cap is still
   // persisted (so switching back to manual restores the prior value) but
   // the public endpoint reports the live catalog max. Same 100,000 upper
@@ -281,6 +314,7 @@ const serialize = (s) => ({
   home_hero_features: s.home_hero_features,
   delivery_slots: s.delivery_slots || [],
   category_promotions: s.category_promotions || [],
+  cross_sell_rules: s.cross_sell_rules || [],
   max_price_filter_auto: s.max_price_filter_auto,
   max_price_filter_cap: Number(s.max_price_filter_cap),
   global_discount_enabled: s.global_discount_enabled,
@@ -336,6 +370,7 @@ router.put('/',
       home_hero_features: req.body.home_hero_features,
       delivery_slots: req.body.delivery_slots,
       category_promotions: req.body.category_promotions,
+      cross_sell_rules: req.body.cross_sell_rules,
       max_price_filter_auto: req.body.max_price_filter_auto,
       max_price_filter_cap: req.body.max_price_filter_cap,
       global_discount_enabled: req.body.global_discount_enabled,

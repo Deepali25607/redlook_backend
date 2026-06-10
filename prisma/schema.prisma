@@ -639,6 +639,15 @@ model BusinessSettings {
   // the storefront. Shape:
   //   [{ id, image_url, category_id, alt, enabled }]
   category_promotions        Json     @default("[]")
+  // Frequently-Bought-Together / cross-sell rules. When a customer adds a
+  // product whose category matches `trigger_category_id`, the storefront pops
+  // a "Suggested items" modal listing the rule's `product_ids` with quick
+  // add-to-cart buttons. Admin-managed under Settings → Frequently Bought
+  // Together. Disabled rules stay in the catalog (kept for the next campaign)
+  // but never fire. Empty array = feature is dormant (no modal ever shows).
+  // Shape:
+  //   [{ id, trigger_category_id, title, subtitle, product_ids:[...], enabled }]
+  cross_sell_rules           Json     @default("[]")
   // Per-field translations for admin-editable storefront copy. Flat key
   // shape so the admin form can iterate without recursive logic:
   //   { company_name: { hi, bn }, company_tagline: { hi, bn },
