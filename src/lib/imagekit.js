@@ -71,7 +71,7 @@ const MIME_TO_EXT = {
 //
 // `mimetype` is optional but lets us pick a meaningful filename suffix
 // when the caller knows it (multer puts it on req.file.mimetype).
-export async function uploadBuffer(buffer, { folder, mimetype, resourceType = 'image' } = {}) {
+export async function uploadBuffer(buffer, { folder, mimetype, resourceType = 'image', maxDimension = 2000 } = {}) {
   void resourceType; // accepted for API compatibility; ImageKit auto-detects
 
   const ext = MIME_TO_EXT[mimetype] || 'jpg';
@@ -110,6 +110,14 @@ export async function uploadBuffer(buffer, { folder, mimetype, resourceType = 'i
     fileName,
     folder, // ImageKit expects a slash-prefixed path; our routes pass things like "redlook/products"
     useUniqueFileName: true,
+    // Pre-transformation: applied BEFORE the asset is stored, so the
+    // Media Library keeps an already-optimized original. `c-at_max` caps
+    // the longest edge at maxDimension without ever upscaling (small
+    // images pass through untouched), and `q-80` is ImageKit's
+    // visually-lossless compression default. The browser also compresses
+    // before upload; this is the safety net for any client that doesn't,
+    // guaranteeing the catalog never stores a raw multi-MB original.
+    transformation: { pre: `w-${maxDimension},c-at_max,q-80` },
   });
 
   // Normalise to Cloudinary-shaped fields so legacy route code
